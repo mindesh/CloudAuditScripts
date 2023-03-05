@@ -1,50 +1,114 @@
-# PowerShell script that will iterate through all subscriptions, capture the configuration of all VNETs and NSGs, and export the results to a CSV file.
-# Make sure to update the $outputFilePath variable to specify the path and filename for the CSV file that the results will be exported to. 
-# The script will prompt you to log in to Azure if you're not already logged in. 
+# PowerShell script that will iterate through all subscriptions, capture the configuration of all VNETs and NSGs, UDRs and their contents and associations and export the results to CSV files.
 # The script may take some time to run if you have a large number of subscriptions and resources, so be patient.
 # In order to yeld accurate results, be sure to have Global Reader permissions.
 
-# Connect to Azure
+# Login to Azure with your credentials
 Connect-AzAccount
 
-# Set output file path
-$outputFilePath = "C:\temp\azure-network-config.csv"
+$Subscriptions = Get-AzSubscription
 
-# Initialize an array to hold the results
-$results = @()
+$VNETConfig = @()
 
-# Loop through all subscriptions
-foreach ($subscription in Get-AzSubscription) {
-    # Set the current subscription context
-    Set-AzContext -SubscriptionId $subscription.Id
+foreach ($Subscription in $Subscriptions) {
+    Set-AzContext -Subscription $Subscription.Id
+    $VNETs = Get-AzVirtualNetwork
 
-    # Get all VNETs
-    $vnets = Get-AzVirtualNetwork
-
-    # Loop through each VNET
-    foreach ($vnet in $vnets) {
-        # Get the NSGs associated with the VNET
-        $nsgs = Get-AzNetworkSecurityGroup -ResourceGroupName $vnet.ResourceGroupName | Where-Object { $_.Subnets.ID -contains $vnet.Subnets[0].Id }
-
-        # Loop through each NSG
-        foreach ($nsg in $nsgs) {
-            # Get the VMs associated with the NSG
-            $vms = Get-AzVM | Where-Object { $_.NetworkProfile.NetworkInterfaces.NetworkSecurityGroup.ID -eq $nsg.Id }
-
-            # Create a custom object to hold the results
-            $result = New-Object -TypeName PSObject
-            $result | Add-Member -MemberType NoteProperty -Name SubscriptionName -Value $subscription.Name
-            $result | Add-Member -MemberType NoteProperty -Name ResourceGroupName -Value $vnet.ResourceGroupName
-            $result | Add-Member -MemberType NoteProperty -Name VNetName -Value $vnet.Name
-            $result | Add-Member -MemberType NoteProperty -Name NSGName -Value $nsg.Name
-            $result | Add-Member -MemberType NoteProperty -Name NSGResourceGroupName -Value $nsg.ResourceGroupName
-            $result | Add-Member -MemberType NoteProperty -Name AssociatedVMs -Value ($vms.Name -join ',')
-            
-            # Add the custom object to the results array
-            $results += $result
+    foreach ($VNET in $VNETs) {
+        $VNETConfig += [PSCustomObject]@{
+            SubscriptionName = $Subscription.Name
+            SubscriptionID   = $Subscription.Id
+            VNETName         = $VNET.Name
+            VNETAddressSpace = $VNET.AddressSpace.AddressPrefixes -join '; '
+            ResourceGroup    = $VNET.ResourceGroupName
+            Location         = $VNET.Location
+            Subnets          = $VNET.Subnets.Name -join '; '
         }
     }
 }
 
-# Export the results to a CSV file
-$results | Export-Csv -Path $outputFilePath -NoTypeInformation
+$VNETConfig | Export-Csv -Path "VNETconfig.csv" -NoTypeInformation
+
+###
+
+# Initialize empty array to hold NSG configurations
+$nsgConfigs = @()
+
+# Iterate through all subscriptions within the tenant
+$subIds = Get-AzSubscription | Select-Object -ExpandProperty SubscriptionId
+foreach ($subId in $subIds) {
+    Set-AzContext -SubscriptionId $subId
+
+    # Get all VNETs and VMs in the subscription
+    $vnetVMs = Get-AzResource -ResourceType "Microsoft.Network/virtualNetworks" `
+        -ExpandProperties | Where-Object {$_.properties.subnets -ne $null} `
+        | Select-Object -ExpandProperty properties.subnets | Select-Object -ExpandProperty properties
+
+    # Iterate through all NSGs in the subscription
+    $nsgs = Get-AzNetworkSecurityGroup
+    foreach ($nsg in $nsgs) {
+        # Get NSG configuration
+        $nsgConfig = [ordered]@{
+            SubscriptionId = $subId
+            ResourceGroupName = $nsg.ResourceGroupName
+            NSGName = $nsg.Name
+            NSGId = $nsg.Id
+            Location = $nsg.Location
+        }
+
+        # Get the VNET or VM the NSG is assigned to, if any
+        $associatedVnet = $nsg | Get-AzNetworkSecurityGroupAssociation | Where-Object {$_.AssociationType -eq "AssociatedToSubnet"} | Select-Object -ExpandProperty VirtualNetwork
+        $associatedVM = $nsg | Get-AzNetworkInterface | Get-AzVM | Select-Object -ExpandProperty Name
+
+        # Add VNET or VM information to NSG configuration
+        if ($associatedVnet) {
+            $nsgConfig.VNetName = $associatedVnet.Name
+            $nsgConfig.VNetId = $associatedVnet.Id
+        }
+        if ($associatedVM) {
+            $nsgConfig.VMName = $associatedVM
+        }
+
+        # Add NSG configuration to array
+        $nsgConfigs += New-Object PSObject -Property $nsgConfig
+    }
+}
+
+# Export NSG configurations to CSV file
+$nsgConfigs | Export-Csv -Path "NSGconfig.csv" -NoTypeInformation
+
+###
+
+# Initialize an empty array to hold the UDR configuration
+$udrConfig = @()
+
+# Get a list of all subscriptions within the tenant
+$subList = Get-AzSubscription -TenantId $tenantId
+
+# Iterate through each subscription and capture UDR configuration
+foreach ($sub in $subList) {
+    # Select the current subscription
+    Set-AzContext -Subscription $sub.Id
+
+    # Get a list of all VNETs within the current subscription
+    $vnetList = Get-AzVirtualNetwork
+
+    # Iterate through each VNET and capture UDR configuration
+    foreach ($vnet in $vnetList) {
+        # Get a list of all UDRs associated with the current VNET
+        $udrList = Get-AzRouteTable -VirtualNetwork $vnet
+
+        # Iterate through each UDR and capture its configuration
+        foreach ($udr in $udrList) {
+            $udrConfig += [PSCustomObject]@{
+                SubscriptionId = $sub.Id
+                SubscriptionName = $sub.Name
+                ResourceGroupName = $udr.ResourceGroupName
+                RouteTableName = $udr.Name
+                VirtualNetworkName = $vnet.Name
+            }
+        }
+    }
+}
+
+# Export the UDR configuration to a CSV file
+$udrConfig | Export-Csv -Path "UDRconfig.csv" -NoTypeInformation
