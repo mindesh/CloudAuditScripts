@@ -7,8 +7,11 @@ Connect-AzAccount
 
 $Subscriptions = Get-AzSubscription
 
+# Initialize empty array to hold VNET configurations
+
 $VNETConfig = @()
 
+# Iterate through all subscriptions within the tenant
 foreach ($Subscription in $Subscriptions) {
     Set-AzContext -Subscription $Subscription.Id
     $VNETs = Get-AzVirtualNetwork
