@@ -5,10 +5,12 @@
 # Login to Azure with your credentials
 Connect-AzAccount
 
+### VNET config list
+
+# Get all subscriptions within the tenant
 $Subscriptions = Get-AzSubscription
 
 # Initialize empty array to hold VNET configurations
-
 $VNETConfig = @()
 
 # Iterate through all subscriptions within the tenant
@@ -31,7 +33,7 @@ foreach ($Subscription in $Subscriptions) {
 
 $VNETConfig | Export-Csv -Path "VNETconfig.csv" -NoTypeInformation
 
-###
+### NSG config list
 
 # Initialize empty array to hold NSG configurations
 $nsgConfigs = @()
@@ -79,7 +81,7 @@ foreach ($subId in $subIds) {
 # Export NSG configurations to CSV file
 $nsgConfigs | Export-Csv -Path "NSGconfig.csv" -NoTypeInformation
 
-###
+### UDR config list
 
 # Initialize an empty array to hold the UDR configuration
 $udrConfig = @()
@@ -115,3 +117,34 @@ foreach ($sub in $subList) {
 
 # Export the UDR configuration to a CSV file
 $udrConfig | Export-Csv -Path "UDRconfig.csv" -NoTypeInformation
+
+### Public IP list
+
+ Get all subscriptions within the tenant
+$subscriptions = Get-AzSubscription | Select-Object SubscriptionId
+
+# Create an empty array to store public IPs
+$publicIps = @()
+
+# Iterate through each subscription
+foreach ($sub in $subscriptions) {
+
+    # Set the current subscription context
+    Set-AzContext -SubscriptionId $sub.SubscriptionId
+    
+    # Get all resources with public IP addresses
+    $resources = Get-AzResource -ExpandProperties | Where-Object {$_.Properties.PublicIPAddress -ne $null}
+    
+    # Iterate through each resource and extract its public IP address
+    foreach ($resource in $resources) {
+        $publicIp = $resource.Properties.PublicIPAddress.Id.Split("/")[-1]
+        $publicIps += [PSCustomObject]@{
+            ResourceName = $resource.Name
+            ResourceType = $resource.ResourceType
+            PublicIPAddress = $publicIp
+        }
+    }
+}
+
+# Export the results to a CSV file
+$publicIps | Export-Csv -Path "public_ips.csv" -NoTypeInformation
