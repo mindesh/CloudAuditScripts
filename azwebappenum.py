@@ -41,9 +41,11 @@ with open(output_file, 'r') as file:
             if part:  # Avoid adding empty strings
                 processed_urls.add(part.strip())
 
-# Save the processed unique URLs back to the file
+# Filter out URLs containing "scm", remove leading dots, and save the processed unique URLs back to the file
 with open(output_file, 'w') as file:
     for url in sorted(processed_urls):
-        file.write(url + '\n')
+        clean_url = url.lstrip('.')  # Remove leading dot if present
+        if "scm" not in clean_url:
+            file.write(clean_url + '\n')
 
 print(f"Processed unique URLs saved to {output_file}")
