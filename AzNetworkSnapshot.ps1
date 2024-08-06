@@ -33,54 +33,6 @@ foreach ($Subscription in $Subscriptions) {
 
 $VNETConfig | Export-Csv -Path "VNETconfig.csv" -NoTypeInformation
 
-### NSG config list
-
-# Initialize empty array to hold NSG configurations
-$nsgConfigs = @()
-
-# Iterate through all subscriptions within the tenant
-$subIds = Get-AzSubscription | Select-Object -ExpandProperty SubscriptionId
-foreach ($subId in $subIds) {
-    Set-AzContext -SubscriptionId $subId
-
-    # Get all VNETs and VMs in the subscription
-    $vnetVMs = Get-AzResource -ResourceType "Microsoft.Network/virtualNetworks" `
-        -ExpandProperties | Where-Object {$_.properties.subnets -ne $null} `
-        | Select-Object -ExpandProperty properties.subnets | Select-Object -ExpandProperty properties
-
-    # Iterate through all NSGs in the subscription
-    $nsgs = Get-AzNetworkSecurityGroup
-    foreach ($nsg in $nsgs) {
-        # Get NSG configuration
-        $nsgConfig = [ordered]@{
-            SubscriptionId = $subId
-            ResourceGroupName = $nsg.ResourceGroupName
-            NSGName = $nsg.Name
-            NSGId = $nsg.Id
-            Location = $nsg.Location
-        }
-
-        # Get the VNET or VM the NSG is assigned to, if any
-        $associatedVnet = $nsg | Get-AzNetworkSecurityGroupAssociation | Where-Object {$_.AssociationType -eq "AssociatedToSubnet"} | Select-Object -ExpandProperty VirtualNetwork
-        $associatedVM = $nsg | Get-AzNetworkInterface | Get-AzVM | Select-Object -ExpandProperty Name
-
-        # Add VNET or VM information to NSG configuration
-        if ($associatedVnet) {
-            $nsgConfig.VNetName = $associatedVnet.Name
-            $nsgConfig.VNetId = $associatedVnet.Id
-        }
-        if ($associatedVM) {
-            $nsgConfig.VMName = $associatedVM
-        }
-
-        # Add NSG configuration to array
-        $nsgConfigs += New-Object PSObject -Property $nsgConfig
-    }
-}
-
-# Export NSG configurations to CSV file
-$nsgConfigs | Export-Csv -Path "NSGconfig.csv" -NoTypeInformation
-
 ### UDR config list
 
 # Initialize an empty array to hold the UDR configuration
