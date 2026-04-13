@@ -1,0 +1,44 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv/
+venv/
+env/
+.env
+*.egg-info/
+build/
+dist/
+.eggs/
+
+# Testing
+.pytest_cache/
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+.tox/
+.mypy_cache/
+.ruff_cache/
+
+# IDE / editor
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+
+# Local snapshot output from azNetAudit runs
+*_snapshot_*.json
+snapshots/
+
+# Internal dev artifacts
+docs/superpowers/
+
+# Secrets / credentials (defense in depth)
+*.pem
+*.key
+*.pfx
+credentials.json
