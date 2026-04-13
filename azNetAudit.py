@@ -416,6 +416,7 @@ ARG_QUERIES = {
             state=properties.state, httpsOnly=properties.httpsOnly,
             publicNetworkAccess=properties.publicNetworkAccess,
             vnetSubnetId=properties.virtualNetworkSubnetId,
+            defaultHostName=properties.defaultHostName,
             peCount=array_length(properties.privateEndpointConnections)
     """,
     "storage_accounts": """
@@ -481,6 +482,7 @@ ARG_QUERIES = {
         | where type == "microsoft.containerservice/managedclusters"
         | project subscriptionId, id, name, resourceGroup, location,
             kubernetesVersion=properties.kubernetesVersion,
+            fqdn=properties.fqdn,
             privateCluster=properties.apiServerAccessProfile.enablePrivateCluster,
             authorizedIpRanges=properties.apiServerAccessProfile.authorizedIPRanges,
             networkPlugin=properties.networkProfile.networkPlugin,
@@ -1325,6 +1327,7 @@ def assemble_snapshot(sub_list, raw):
             "min_tls_version": "1.0",  # Will be enriched by REST
             "public_network_access": app.get("publicNetworkAccess") or "Enabled",
             "vnet_integration": resource_id_name(vnet_sub_id) if vnet_sub_id else "",
+            "default_host_name": app.get("defaultHostName") or f"{app.get('name', '')}.azurewebsites.net",
             "private_endpoints": app.get("peCount") or 0,
             "ip_restrictions_count": 0,  # Will be enriched
             "has_ip_restrictions": False,  # Will be enriched
@@ -1444,6 +1447,7 @@ def assemble_snapshot(sub_list, raw):
             "resource_group": row.get("resourceGroup", ""),
             "location": row.get("location", ""),
             "kubernetes_version": row.get("kubernetesVersion") or "",
+            "fqdn": row.get("fqdn") or "",
             "private_cluster": bool(row.get("privateCluster")),
             "authorized_ip_ranges": row.get("authorizedIpRanges") or [],
             "network_plugin": row.get("networkPlugin") or "",
@@ -1953,6 +1957,7 @@ def run_validation(snapshot_subs):
                     "has_nsg": False, "has_route_table": False,
                     "has_firewall_route": False, "internet_access": "",
                     "detail": f"{app_name} ({kind_label}) is publicly accessible with no IP restrictions — {https_status}, {tls_status}",
+                    "endpoint": app.get("default_host_name") or f"{app_name}.azurewebsites.net",
                 })
 
             if app.get("verdict") != "PRIVATE_ONLY" and not app.get("https_only"):
@@ -2007,6 +2012,7 @@ def run_validation(snapshot_subs):
                     "has_firewall_route": False,
                     "internet_access": "",
                     "detail": f"VM '{vm_name}' has public IP {ip_addr} but neither its NIC nor subnet '{pip_subnet}' has an NSG",
+                    "endpoint": ip_addr,
                 })
 
     # Storage HTTPS gap analysis: STORAGE-HTTP-ALLOWED
@@ -2024,6 +2030,7 @@ def run_validation(snapshot_subs):
                     "has_nsg": False, "has_route_table": False,
                     "has_firewall_route": False, "internet_access": "",
                     "detail": f"Storage account '{sa['name']}' allows unencrypted HTTP traffic (HTTPS not enforced)",
+                    "endpoint": f"{sa['name']}.blob.core.windows.net",
                 })
 
 
@@ -2166,6 +2173,7 @@ def _analyze_resource_gaps(snapshot_subs):
                 fw.get("start_ip") == "0.0.0.0" and fw.get("end_ip") == "0.0.0.0"
                 for fw in sql.get("firewall_rules", [])
             )
+            sql_endpoint = f"{server_name}.database.windows.net"
             if has_allow_all_azure and pe_count == 0:
                 sub_data["gaps"].append({
                     "type": "SQL-ALLOW-ALL-AZURE", "severity": "CRITICAL",
@@ -2173,6 +2181,7 @@ def _analyze_resource_gaps(snapshot_subs):
                     "has_nsg": False, "has_route_table": False,
                     "has_firewall_route": False, "internet_access": "",
                     "detail": f"{server_name} has 'Allow Azure services' enabled with no private endpoints — any Azure tenant can connect",
+                    "endpoint": sql_endpoint,
                 })
 
             # HIGH: SQL-PUBLIC-EXPOSED
@@ -2184,6 +2193,7 @@ def _analyze_resource_gaps(snapshot_subs):
                     "has_nsg": False, "has_route_table": False,
                     "has_firewall_route": False, "internet_access": "",
                     "detail": f"SQL server '{server_name}' has public network access enabled with no private endpoints",
+                    "endpoint": sql_endpoint,
                 })
 
             # HIGH: SQL-WIDE-FIREWALL
@@ -2199,6 +2209,7 @@ def _analyze_resource_gaps(snapshot_subs):
                             "has_nsg": False, "has_route_table": False,
                             "has_firewall_route": False, "internet_access": "",
                             "detail": f"SQL server '{server_name}' firewall rule '{fw['name']}' spans {span:,} IPs ({fw['start_ip']} → {fw['end_ip']})",
+                            "endpoint": sql_endpoint,
                         })
                 except (ValueError, TypeError):
                     pass
@@ -2229,6 +2240,7 @@ def _analyze_resource_gaps(snapshot_subs):
             cosmos_name = cosmos["name"]
             pub = cosmos.get("public_network_access", "Enabled")
 
+            cosmos_endpoint = f"{cosmos_name}.documents.azure.com"
             # HIGH: COSMOS-PUBLIC-NO-FILTER
             if (pub != "Disabled"
                     and cosmos.get("ip_rules_count", 0) == 0
@@ -2240,6 +2252,7 @@ def _analyze_resource_gaps(snapshot_subs):
                     "has_nsg": False, "has_route_table": False,
                     "has_firewall_route": False, "internet_access": "",
                     "detail": f"Cosmos DB '{cosmos_name}' is publicly accessible with no IP rules, VNet filter, or private endpoints",
+                    "endpoint": cosmos_endpoint,
                 })
 
             # MEDIUM: COSMOS-LOCAL-AUTH
@@ -2256,6 +2269,7 @@ def _analyze_resource_gaps(snapshot_subs):
         for kv in sub_data.get("key_vaults", []):
             kv_name = kv["name"]
 
+            kv_endpoint = f"{kv_name}.vault.azure.net"
             # HIGH: KEYVAULT-NETWORK-OPEN
             if (kv.get("network_default_action") == "Allow"
                     and kv.get("public_network_access") != "Disabled"):
@@ -2265,6 +2279,7 @@ def _analyze_resource_gaps(snapshot_subs):
                     "has_nsg": False, "has_route_table": False,
                     "has_firewall_route": False, "internet_access": "",
                     "detail": f"Key Vault '{kv_name}' has default network action Allow — accessible from any network",
+                    "endpoint": kv_endpoint,
                 })
 
             # MEDIUM: KEYVAULT-NO-PRIVATE-ENDPOINT
@@ -2281,6 +2296,11 @@ def _analyze_resource_gaps(snapshot_subs):
         for db in sub_data.get("mysql_postgresql", []):
             db_name = db["name"]
             db_type = db.get("type", "").split("/")[-1]
+            db_full_type = db.get("type", "")
+            if "mysql" in db_full_type.lower():
+                db_endpoint = f"{db_name}.mysql.database.azure.com"
+            else:
+                db_endpoint = f"{db_name}.postgres.database.azure.com"
 
             # HIGH: DB-PUBLIC-EXPOSED
             if (db.get("public_network_access") != "Disabled"
@@ -2291,6 +2311,7 @@ def _analyze_resource_gaps(snapshot_subs):
                     "has_nsg": False, "has_route_table": False,
                     "has_firewall_route": False, "internet_access": "",
                     "detail": f"{db_type} server '{db_name}' has public network access enabled with no private endpoints",
+                    "endpoint": db_endpoint,
                 })
 
             # MEDIUM: DB-NO-SSL
@@ -2308,6 +2329,7 @@ def _analyze_resource_gaps(snapshot_subs):
         for aks in sub_data.get("aks_clusters", []):
             aks_name = aks["name"]
 
+            aks_endpoint = aks.get("fqdn") or ""
             # CRITICAL: AKS-PUBLIC-API-NO-RESTRICTIONS
             ip_ranges = aks.get("authorized_ip_ranges") or []
             if not aks.get("private_cluster") and not ip_ranges:
@@ -2317,6 +2339,7 @@ def _analyze_resource_gaps(snapshot_subs):
                     "has_nsg": False, "has_route_table": False,
                     "has_firewall_route": False, "internet_access": "",
                     "detail": f"AKS cluster '{aks_name}' API server is public with no IP restrictions — anyone can attempt authentication",
+                    "endpoint": aks_endpoint,
                 })
 
             # MEDIUM: AKS-NO-NETWORK-POLICY
@@ -2367,6 +2390,11 @@ def _analyze_resource_gaps(snapshot_subs):
         for msg in sub_data.get("messaging", []):
             msg_name = msg["name"]
             msg_type = msg.get("type", "").split("/")[-1]
+            msg_full_type = msg.get("type", "").lower()
+            if "redis" in msg_full_type:
+                msg_endpoint = f"{msg_name}.redis.cache.windows.net"
+            else:
+                msg_endpoint = f"{msg_name}.servicebus.windows.net"
 
             # MEDIUM: MESSAGING-PUBLIC-EXPOSED
             if (msg.get("public_network_access") != "Disabled"
@@ -2378,6 +2406,7 @@ def _analyze_resource_gaps(snapshot_subs):
                     "has_nsg": False, "has_route_table": False,
                     "has_firewall_route": False, "internet_access": "",
                     "detail": f"{msg_type} '{msg_name}' is publicly accessible with no private endpoints and default action Allow",
+                    "endpoint": msg_endpoint,
                 })
 
 
@@ -2397,6 +2426,7 @@ def generate_advisory(subscriptions, metadata):
                 "type": gap["type"],
                 "severity": gap["severity"],
                 "detail": gap.get("detail", ""),
+                "endpoint": gap.get("endpoint", ""),
             })
 
     timestamp_str = metadata.get("timestamp", datetime.now(timezone.utc).isoformat())
@@ -2421,18 +2451,21 @@ def generate_advisory(subscriptions, metadata):
             f.writelines(lines)
         return filename
 
-    # Consolidate by (sub_id, gap_type) — merge details into bulleted list
-    consolidated = {}  # (sub_id, gap_type) → {sub_name, severity, details: [str]}
+    # Consolidate by gap_type — group all subscriptions under each category
+    consolidated = {}  # gap_type → {severity, details: [{sub_name, detail, endpoint}]}
     for finding in all_findings:
-        key = (finding["sub_id"], finding["type"])
+        key = finding["type"]
         if key not in consolidated:
             consolidated[key] = {
-                "sub_name": finding["sub_name"],
                 "type": finding["type"],
                 "severity": finding["severity"],
                 "details": [],
             }
-        consolidated[key]["details"].append(finding["detail"])
+        consolidated[key]["details"].append({
+            "sub_name": finding["sub_name"],
+            "detail": finding["detail"],
+            "endpoint": finding["endpoint"],
+        })
 
     # Organize by theme
     themed_sections = []
@@ -2449,9 +2482,9 @@ def generate_advisory(subscriptions, metadata):
                 total_findings += 1
         if theme_entries:
             themes_with_findings += 1
-            # Sort within theme: CRITICAL first, then HIGH, then MEDIUM
+            # Sort within theme: CRITICAL first, then HIGH, then MEDIUM, then alphabetical by type
             sev_order = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2}
-            theme_entries.sort(key=lambda e: (sev_order.get(e["severity"], 9), e["sub_name"]))
+            theme_entries.sort(key=lambda e: (sev_order.get(e["severity"], 9), e["type"]))
             themed_sections.append((theme_name, theme_entries))
 
     # Generate Markdown
@@ -2491,25 +2524,23 @@ def generate_advisory(subscriptions, metadata):
         for entry in entries:
             gap_type = entry["type"]
             details = entry["details"]
-            count = len(details)
+            total_instances = len(details)
 
-            # Title: gap type with count if consolidated
-            if count > 1:
-                title = f"{gap_type} ({count} instances)"
+            # Title: gap type with count
+            if total_instances > 1:
+                title = f"{gap_type} ({total_instances} instances)"
             else:
                 title = gap_type
 
             lines.append(f"### {title}\n")
-            lines.append(f"**Subscription:** {entry['sub_name']}\n")
             lines.append(f"**Severity:** {entry['severity']}\n\n")
 
-            # Resource details
-            if count == 1:
-                lines.append(f"{details[0]}\n\n")
-            else:
-                for d in details:
-                    lines.append(f"- {d}\n")
-                lines.append("\n")
+            # Resource details — each item shows subscription, detail, and endpoint
+            for d in details:
+                lines.append(f"- **{d['sub_name']}** — {d['detail']}\n")
+                if d["endpoint"]:
+                    lines.append(f"  Endpoint: `{d['endpoint']}`\n")
+            lines.append("\n")
 
             # Impact narrative
             narrative = IMPACT_NARRATIVES.get(gap_type, "")
