@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Azure Network Auditor v2.0 — Resource Graph Edition.
+Azure Cloud Auditor v3.0 — Resource Graph Edition.
 
 Drop-in replacement for aznetaudit.py (v1.2) that uses Azure Resource Graph
 bulk queries + direct REST API calls instead of az CLI subprocesses.
@@ -23,6 +23,7 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
+import ipaddress
 
 try:
     import requests
@@ -31,7 +32,7 @@ except ImportError:
     subprocess.check_call([sys.executable, "-m", "pip", "install", "requests"])
     import requests
 
-VERSION = "2.0.0"
+VERSION = "3.0.0"
 
 # ─── Colors ───────────────────────────────────────────────────────────────────
 
@@ -76,6 +77,226 @@ SPINNER = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
 # ARM API endpoint
 ARM_BASE = "https://management.azure.com"
 ARG_API = "2022-10-01"
+
+# ─── Advisory Themes and Impact Narratives ───────────────────────────────────
+
+ADVISORY_THEMES = [
+    ("Internet-Exposed Data Services", [
+        "SQL-PUBLIC-EXPOSED", "SQL-ALLOW-ALL-AZURE", "SQL-WIDE-FIREWALL",
+        "COSMOS-PUBLIC-NO-FILTER", "DB-PUBLIC-EXPOSED", "KEYVAULT-NETWORK-OPEN",
+        "MESSAGING-PUBLIC-EXPOSED", "APP-PUBLIC-EXPOSED",
+    ]),
+    ("Unprotected Network Segments", [
+        "NO-FIREWALL-NO-NSG", "NO-NSG", "DIRECT-INTERNET",
+    ]),
+    ("Firewall Bypass and Weakness", [
+        "FIREWALL-PERMISSIVE-RULE", "FIREWALL-THREAT-INTEL-OFF",
+        "PEERING-ASYMMETRY", "FORWARDED-TRAFFIC-RISK", "SERVICE-ENDPOINT-BYPASS",
+    ]),
+    ("Kubernetes Exposure", [
+        "AKS-PUBLIC-API-NO-RESTRICTIONS", "AKS-NO-NETWORK-POLICY",
+    ]),
+    ("Public VM Exposure", [
+        "VM-PUBLIC-NO-NSG", "INBOUND-ANY-ALLOW",
+    ]),
+    ("Unmonitored Traffic", [
+        "FLOW-LOGS-DISABLED", "NETWORK-WATCHER-DISABLED", "SQL-NO-AUDITING",
+    ]),
+    ("Transport Security", [
+        "SQL-WEAK-TLS", "DB-NO-SSL", "APP-WEAK-TLS", "APP-NO-HTTPS",
+        "STORAGE-HTTP-ALLOWED", "COSMOS-LOCAL-AUTH",
+    ]),
+    ("DNS and Connectivity", [
+        "PRIVATE-DNS-MISSING", "KEYVAULT-NO-PRIVATE-ENDPOINT",
+    ]),
+]
+
+IMPACT_NARRATIVES = {
+    "NO-FIREWALL-NO-NSG": (
+        "These subnets have no network security controls at all — no NSG filtering "
+        "traffic and no route table directing traffic through a firewall. Any resource "
+        "with network connectivity to the VNet can reach workloads in these subnets "
+        "without inspection. If a single VM is compromised, the attacker has unrestricted "
+        "lateral movement within the subnet and can probe adjacent subnets without any "
+        "logging or filtering."
+    ),
+    "NO-NSG": (
+        "Subnets without an NSG have no network-level access control lists. While a "
+        "firewall route may inspect north-south traffic, east-west traffic between "
+        "subnets within the same VNet bypasses the firewall entirely. An attacker who "
+        "gains access to one resource can freely probe other resources in the same VNet."
+    ),
+    "DIRECT-INTERNET": (
+        "These subnets have a direct path to the internet that does not pass through a "
+        "firewall or network virtual appliance. Any outbound connection — including data "
+        "exfiltration, command-and-control callbacks, or malware downloads — can reach "
+        "the internet without inspection or logging."
+    ),
+    "INBOUND-ANY-ALLOW": (
+        "NSG rules allowing inbound traffic from any source to high-risk ports expose "
+        "management and database interfaces to the entire internet. Automated scanners "
+        "continuously probe these ports, and a single weak credential or unpatched "
+        "vulnerability leads to immediate compromise."
+    ),
+    "PEERING-ASYMMETRY": (
+        "When one side of a VNet peering routes through a firewall and the other does "
+        "not, the security boundary is incomplete. An attacker in the unprotected VNet "
+        "can reach resources in the protected VNet through the peering link, bypassing "
+        "the firewall entirely."
+    ),
+    "FORWARDED-TRAFFIC-RISK": (
+        "This peering allows forwarded traffic into a VNet that has no firewall routing. "
+        "Traffic originating from remote networks — including on-premises or other peered "
+        "VNets — enters this VNet without inspection. This creates a lateral movement "
+        "path that bypasses network security controls."
+    ),
+    "SERVICE-ENDPOINT-BYPASS": (
+        "Service endpoints route traffic to Azure PaaS services directly from the subnet, "
+        "bypassing any firewall in the traffic path. While this improves performance, it "
+        "means the firewall cannot inspect or log access to these services. Data "
+        "exfiltration to a storage account or database via service endpoints is invisible "
+        "to the firewall."
+    ),
+    "PRIVATE-DNS-MISSING": (
+        "VNets with private endpoints but no privatelink DNS zone links cannot resolve "
+        "private endpoint hostnames to their private IP addresses. Clients fall back to "
+        "the public DNS resolution, routing traffic over the internet instead of the "
+        "private link — negating the security benefit of the private endpoint."
+    ),
+    "VM-PUBLIC-NO-NSG": (
+        "Virtual machines with public IP addresses and no NSG on either the NIC or "
+        "subnet are directly exposed to the internet with no network filtering. Every "
+        "listening service on the VM is reachable from any IP address worldwide."
+    ),
+    "FLOW-LOGS-DISABLED": (
+        "NSGs without flow logs produce no record of accepted or denied traffic. In the "
+        "event of a security incident, there is no network telemetry to reconstruct "
+        "attacker movements, identify compromised resources, or determine the scope "
+        "of a breach."
+    ),
+    "NETWORK-WATCHER-DISABLED": (
+        "Network Watcher is not provisioned in this region, which means NSG flow logs "
+        "cannot be enabled for any NSG in the region. All network traffic in the affected "
+        "region is completely unmonitored."
+    ),
+    "APP-PUBLIC-EXPOSED": (
+        "This App Service is publicly accessible with no IP restrictions, exposing the "
+        "application to the entire internet. Any vulnerability in the application — "
+        "authentication bypass, injection flaw, or misconfiguration — is directly "
+        "exploitable by anyone."
+    ),
+    "APP-NO-HTTPS": (
+        "Without HTTPS enforcement, clients may connect over unencrypted HTTP. Credentials, "
+        "session tokens, and sensitive data transmitted in plaintext can be intercepted "
+        "by anyone on the network path."
+    ),
+    "APP-WEAK-TLS": (
+        "Allowing TLS versions below 1.2 exposes the application to known cryptographic "
+        "weaknesses in older TLS protocols. Downgrade attacks can force connections to "
+        "weaker ciphers that are vulnerable to interception."
+    ),
+    "STORAGE-HTTP-ALLOWED": (
+        "Storage accounts that allow unencrypted HTTP traffic risk exposing data in "
+        "transit. Shared access signatures, account keys, and blob contents transmitted "
+        "over HTTP can be intercepted on the network path."
+    ),
+    "SQL-ALLOW-ALL-AZURE": (
+        "The 'Allow Azure services' firewall rule (0.0.0.0 to 0.0.0.0) permits connections "
+        "from any Azure-hosted service across any tenant — not just yours. Combined with "
+        "no private endpoints, this server is reachable from any compromised workload in "
+        "any Azure subscription worldwide. An attacker with stolen credentials or a SQL "
+        "injection vulnerability can connect from anywhere in Azure."
+    ),
+    "SQL-PUBLIC-EXPOSED": (
+        "This SQL server has public network access enabled with no private endpoints. "
+        "Combined with firewall rules, it is accessible over the internet. Private "
+        "endpoints ensure traffic stays on the Microsoft backbone network and is not "
+        "exposed to the public internet."
+    ),
+    "SQL-WIDE-FIREWALL": (
+        "A SQL firewall rule spanning more than 256 IP addresses is overly broad. Large "
+        "CIDR ranges increase the attack surface by allowing connections from many hosts "
+        "that do not need database access. An attacker within the allowed range can "
+        "connect without triggering firewall denials."
+    ),
+    "SQL-WEAK-TLS": (
+        "Allowing TLS versions below 1.2 for SQL Server connections exposes database "
+        "traffic to known protocol weaknesses. Attackers can exploit TLS downgrade "
+        "attacks to intercept or modify queries and results in transit."
+    ),
+    "SQL-NO-AUDITING": (
+        "SQL Server auditing is not enabled. Without audit logs, there is no record of "
+        "who accessed the database, what queries were executed, or whether data was "
+        "modified or exfiltrated. Incident response and forensic investigation become "
+        "significantly more difficult."
+    ),
+    "COSMOS-PUBLIC-NO-FILTER": (
+        "This Cosmos DB account is publicly accessible with no IP rules, no VNet filter, "
+        "and no private endpoints. Any client on the internet with valid credentials can "
+        "connect directly. If account keys are leaked or an application has an injection "
+        "vulnerability, the database is immediately accessible."
+    ),
+    "COSMOS-LOCAL-AUTH": (
+        "Cosmos DB local authentication (account keys) is enabled alongside public "
+        "access. Account keys provide full unrestricted access and cannot be scoped to "
+        "specific operations or data. If a key is leaked, the attacker has complete "
+        "access to all data without any audit trail tied to an identity."
+    ),
+    "KEYVAULT-NETWORK-OPEN": (
+        "This Key Vault has its network default action set to Allow, meaning it accepts "
+        "connections from any network. Key Vaults store the most sensitive material in "
+        "an environment — encryption keys, secrets, certificates. Unrestricted network "
+        "access means anyone who obtains valid credentials can retrieve secrets from "
+        "any network location."
+    ),
+    "KEYVAULT-NO-PRIVATE-ENDPOINT": (
+        "This Key Vault has no private endpoints. Even with IP-based firewall rules, "
+        "traffic to the Key Vault traverses the public internet. Private endpoints "
+        "ensure that secret retrieval stays on the Microsoft backbone network and "
+        "cannot be intercepted or redirected."
+    ),
+    "DB-PUBLIC-EXPOSED": (
+        "This database server has public network access enabled with no private "
+        "endpoints. The database is reachable over the public internet, increasing "
+        "exposure to credential brute-force attacks, SQL injection from compromised "
+        "applications, and unauthorized access if firewall rules are misconfigured."
+    ),
+    "DB-NO-SSL": (
+        "SSL enforcement is not enabled for this database server. Connections without "
+        "SSL transmit queries, results, and credentials in plaintext. Any observer on "
+        "the network path can intercept database traffic."
+    ),
+    "AKS-PUBLIC-API-NO-RESTRICTIONS": (
+        "This AKS cluster's API server is publicly accessible with no authorized IP "
+        "ranges configured. Anyone on the internet can reach the Kubernetes API and "
+        "attempt authentication. A leaked kubeconfig, weak RBAC configuration, or "
+        "unpatched API server vulnerability gives an attacker full cluster control."
+    ),
+    "AKS-NO-NETWORK-POLICY": (
+        "This AKS cluster has no network policy configured. Without network policies, "
+        "every pod can communicate with every other pod in the cluster without "
+        "restriction. If a single pod is compromised, the attacker can reach all "
+        "other workloads, databases, and internal services in the cluster."
+    ),
+    "FIREWALL-PERMISSIVE-RULE": (
+        "This firewall rule uses wildcard sources or destinations with all ports, "
+        "effectively allowing unrestricted traffic through the firewall. The firewall "
+        "provides no security value for traffic matching this rule — it is equivalent "
+        "to having no firewall at all for the affected traffic."
+    ),
+    "FIREWALL-THREAT-INTEL-OFF": (
+        "Azure Firewall threat intelligence is not set to Deny mode. In Alert or Off "
+        "mode, known malicious IP addresses are either only logged or completely "
+        "ignored. Setting threat intelligence to Deny blocks connections to and from "
+        "known malicious IPs automatically."
+    ),
+    "MESSAGING-PUBLIC-EXPOSED": (
+        "This messaging service is publicly accessible with no private endpoints and a "
+        "default network action of Allow. Any client on the internet with valid "
+        "credentials can connect, send, and receive messages. If connection strings are "
+        "leaked, an attacker can consume or inject messages without network-level barriers."
+    ),
+}
 
 # ─── Resource Graph Queries ───────────────────────────────────────────────────
 
@@ -208,6 +429,107 @@ ARG_QUERIES = {
             ipRulesCount=array_length(properties.networkAcls.ipRules),
             vnetRulesCount=array_length(properties.networkAcls.virtualNetworkRules),
             peCount=array_length(properties.privateEndpointConnections)
+    """,
+    # ── v3.0 additions ──
+    "sql_servers": """
+        Resources
+        | where type == "microsoft.sql/servers"
+        | project subscriptionId, id, name, resourceGroup, location,
+            publicNetworkAccess=properties.publicNetworkAccess,
+            minimalTlsVersion=properties.minimalTlsVersion,
+            peCount=array_length(properties.privateEndpointConnections),
+            state=properties.state
+    """,
+    "sql_firewall_rules": """
+        Resources
+        | where type == "microsoft.sql/servers/firewallrules"
+        | project subscriptionId, id, name,
+            serverName=tostring(split(id, '/')[8]),
+            startIp=properties.startIpAddress,
+            endIp=properties.endIpAddress
+    """,
+    "cosmos_db": """
+        Resources
+        | where type == "microsoft.documentdb/databaseaccounts"
+        | project subscriptionId, id, name, resourceGroup, location,
+            publicNetworkAccess=properties.publicNetworkAccess,
+            ipRulesCount=array_length(properties.ipRules),
+            isVirtualNetworkFilterEnabled=properties.isVirtualNetworkFilterEnabled,
+            disableLocalAuth=properties.disableLocalAuth,
+            peCount=array_length(properties.privateEndpointConnections)
+    """,
+    "mysql_postgresql": """
+        Resources
+        | where type in ("microsoft.dbformysql/flexibleservers", "microsoft.dbforpostgresql/flexibleservers")
+        | project subscriptionId, id, name, resourceGroup, type, location,
+            publicNetworkAccess=properties.network.publicNetworkAccess,
+            sslEnforcement=properties.network.sslEnforcement,
+            peCount=array_length(properties.privateEndpointConnections)
+    """,
+    "key_vaults": """
+        Resources
+        | where type =~ "microsoft.keyvault/vaults"
+        | project subscriptionId, id, name, resourceGroup, location,
+            networkDefaultAction=tostring(properties.networkAcls.defaultAction),
+            ipRulesCount=array_length(properties.networkAcls.ipRules),
+            vnetRulesCount=array_length(properties.networkAcls.virtualNetworkRules),
+            peCount=array_length(properties.privateEndpointConnections),
+            publicNetworkAccess=properties.publicNetworkAccess
+    """,
+    "aks_clusters": """
+        Resources
+        | where type == "microsoft.containerservice/managedclusters"
+        | project subscriptionId, id, name, resourceGroup, location,
+            kubernetesVersion=properties.kubernetesVersion,
+            privateCluster=properties.apiServerAccessProfile.enablePrivateCluster,
+            authorizedIpRanges=properties.apiServerAccessProfile.authorizedIPRanges,
+            networkPlugin=properties.networkProfile.networkPlugin,
+            networkPolicy=properties.networkProfile.networkPolicy
+    """,
+    "firewalls": """
+        Resources
+        | where type == "microsoft.network/azurefirewalls"
+        | project subscriptionId, id, name, resourceGroup, location,
+            skuTier=properties.sku.tier,
+            threatIntelMode=properties.threatIntelMode,
+            firewallPolicyId=properties.firewallPolicy.id,
+            provisioningState=properties.provisioningState,
+            networkRuleCollections=properties.networkRuleCollections,
+            applicationRuleCollections=properties.applicationRuleCollections
+    """,
+    "firewall_policy_rules": """
+        networkresources
+        | where type == "microsoft.network/firewallpolicies/rulecollectiongroups"
+        | extend firewallPolicyName = tostring(split(id, '/')[8])
+        | mv-expand ruleCollection = properties.ruleCollections
+        | mv-expand rule = ruleCollection.rules
+        | project subscriptionId, firewallPolicyName,
+            ruleCollectionGroupName=name,
+            ruleCollectionName=ruleCollection.name,
+            ruleCollectionAction=ruleCollection.action.type,
+            ruleName=rule.name,
+            ruleType=rule.ruleType,
+            sourceAddresses=rule.sourceAddresses,
+            destinationAddresses=rule.destinationAddresses,
+            destinationPorts=rule.destinationPorts,
+            protocols=rule.ipProtocols
+    """,
+    "service_bus_eventhub_redis": """
+        Resources
+        | where type in (
+            "microsoft.servicebus/namespaces",
+            "microsoft.eventhub/namespaces",
+            "microsoft.cache/redis"
+        )
+        | project subscriptionId, id, name, resourceGroup, type, location,
+            sku=sku.name,
+            publicNetworkAccess=properties.publicNetworkAccess,
+            minimumTlsVersion=properties.minimumTlsVersion,
+            peCount=array_length(properties.privateEndpointConnections),
+            defaultAction=coalesce(
+                properties.networkRuleSets.defaultAction,
+                properties.networkRuleSet.defaultAction
+            )
     """,
 }
 
@@ -641,6 +963,14 @@ def assemble_snapshot(sub_list, raw):
             "gaps": [],
             "nsg_analysis": [],
             "storage_accounts": [],
+            "sql_servers": [],
+            "cosmos_db": [],
+            "mysql_postgresql": [],
+            "key_vaults": [],
+            "aks_clusters": [],
+            "firewalls": [],
+            "firewall_rules": [],
+            "messaging": [],
         }
 
     # ── Build VNet + Subnet hierarchy ──
@@ -1025,6 +1355,180 @@ def assemble_snapshot(sub_list, raw):
             "details": "",
         })
 
+    # ── SQL Servers + Firewall Rules ──
+    sql_server_map = {}  # (sub_id, server_name_lower) → index in sql_servers list
+    for row in raw.get("sql_servers", []):
+        sub_id = row.get("subscriptionId", "")
+        if sub_id not in subscriptions:
+            continue
+        idx = len(subscriptions[sub_id]["sql_servers"])
+        server = {
+            "name": row.get("name", ""),
+            "resource_group": row.get("resourceGroup", ""),
+            "location": row.get("location", ""),
+            "public_network_access": row.get("publicNetworkAccess") or "Enabled",
+            "min_tls_version": row.get("minimalTlsVersion") or "",
+            "pe_count": row.get("peCount") or 0,
+            "state": row.get("state", ""),
+            "firewall_rules": [],
+            "auditing_enabled": None,
+        }
+        subscriptions[sub_id]["sql_servers"].append(server)
+        sql_server_map[(sub_id, server["name"].lower())] = idx
+
+    for row in raw.get("sql_firewall_rules", []):
+        sub_id = row.get("subscriptionId", "")
+        server_name = (row.get("serverName") or "").lower()
+        idx = sql_server_map.get((sub_id, server_name))
+        if idx is not None:
+            subscriptions[sub_id]["sql_servers"][idx]["firewall_rules"].append({
+                "name": row.get("name", ""),
+                "start_ip": row.get("startIp", ""),
+                "end_ip": row.get("endIp", ""),
+            })
+
+    # ── Cosmos DB ──
+    for row in raw.get("cosmos_db", []):
+        sub_id = row.get("subscriptionId", "")
+        if sub_id not in subscriptions:
+            continue
+        subscriptions[sub_id]["cosmos_db"].append({
+            "name": row.get("name", ""),
+            "resource_group": row.get("resourceGroup", ""),
+            "location": row.get("location", ""),
+            "public_network_access": row.get("publicNetworkAccess") or "Enabled",
+            "ip_rules_count": row.get("ipRulesCount") or 0,
+            "vnet_filter": bool(row.get("isVirtualNetworkFilterEnabled")),
+            "disable_local_auth": bool(row.get("disableLocalAuth")),
+            "pe_count": row.get("peCount") or 0,
+        })
+
+    # ── MySQL / PostgreSQL Flexible Servers ──
+    for row in raw.get("mysql_postgresql", []):
+        sub_id = row.get("subscriptionId", "")
+        if sub_id not in subscriptions:
+            continue
+        subscriptions[sub_id]["mysql_postgresql"].append({
+            "name": row.get("name", ""),
+            "resource_group": row.get("resourceGroup", ""),
+            "type": row.get("type", ""),
+            "location": row.get("location", ""),
+            "public_network_access": row.get("publicNetworkAccess") or "Enabled",
+            "ssl_enforcement": row.get("sslEnforcement") or "",
+            "pe_count": row.get("peCount") or 0,
+        })
+
+    # ── Key Vaults ──
+    for row in raw.get("key_vaults", []):
+        sub_id = row.get("subscriptionId", "")
+        if sub_id not in subscriptions:
+            continue
+        subscriptions[sub_id]["key_vaults"].append({
+            "name": row.get("name", ""),
+            "resource_group": row.get("resourceGroup", ""),
+            "location": row.get("location", ""),
+            "network_default_action": row.get("networkDefaultAction") or "Allow",
+            "ip_rules_count": row.get("ipRulesCount") or 0,
+            "vnet_rules_count": row.get("vnetRulesCount") or 0,
+            "pe_count": row.get("peCount") or 0,
+            "public_network_access": row.get("publicNetworkAccess") or "Enabled",
+        })
+
+    # ── AKS Clusters ──
+    for row in raw.get("aks_clusters", []):
+        sub_id = row.get("subscriptionId", "")
+        if sub_id not in subscriptions:
+            continue
+        subscriptions[sub_id]["aks_clusters"].append({
+            "name": row.get("name", ""),
+            "resource_group": row.get("resourceGroup", ""),
+            "location": row.get("location", ""),
+            "kubernetes_version": row.get("kubernetesVersion") or "",
+            "private_cluster": bool(row.get("privateCluster")),
+            "authorized_ip_ranges": row.get("authorizedIpRanges") or [],
+            "network_plugin": row.get("networkPlugin") or "",
+            "network_policy": row.get("networkPolicy") or "",
+        })
+
+    # ── Azure Firewalls ──
+    firewalls_raw = raw.get("firewalls", [])
+    for row in firewalls_raw:
+        sub_id = row.get("subscriptionId", "")
+        if sub_id not in subscriptions:
+            continue
+        subscriptions[sub_id]["firewalls"].append({
+            "name": row.get("name", ""),
+            "resource_group": row.get("resourceGroup", ""),
+            "location": row.get("location", ""),
+            "sku_tier": row.get("skuTier") or "",
+            "threat_intel_mode": row.get("threatIntelMode") or "",
+            "policy_id": row.get("firewallPolicyId") or "",
+            "provisioning_state": row.get("provisioningState") or "",
+        })
+
+    # ── Firewall Rules (dual model: policy-based + classic inline) ──
+    # Source A: Policy-based rules from firewall_policy_rules query
+    for row in raw.get("firewall_policy_rules", []):
+        sub_id = row.get("subscriptionId", "")
+        if sub_id not in subscriptions:
+            continue
+        subscriptions[sub_id]["firewall_rules"].append({
+            "firewall_policy": row.get("firewallPolicyName", ""),
+            "rule_collection_group": row.get("ruleCollectionGroupName", ""),
+            "rule_collection": row.get("ruleCollectionName", ""),
+            "action": row.get("ruleCollectionAction", ""),
+            "rule_name": row.get("ruleName", ""),
+            "rule_type": row.get("ruleType", ""),
+            "source_addresses": row.get("sourceAddresses") or [],
+            "destination_addresses": row.get("destinationAddresses") or [],
+            "destination_ports": row.get("destinationPorts") or [],
+            "protocols": row.get("protocols") or [],
+            "source": "policy",
+        })
+
+    # Source B: Classic inline rules from firewall resource properties
+    for row in firewalls_raw:
+        sub_id = row.get("subscriptionId", "")
+        if sub_id not in subscriptions:
+            continue
+        fw_name = row.get("name", "")
+        for coll_type in ("networkRuleCollections", "applicationRuleCollections"):
+            for coll in (row.get(coll_type) or []):
+                coll_props = coll.get("properties", {})
+                coll_name = coll.get("name", "")
+                coll_action = coll_props.get("action", {}).get("type", "")
+                for rule in coll_props.get("rules", []):
+                    subscriptions[sub_id]["firewall_rules"].append({
+                        "firewall_policy": fw_name,
+                        "rule_collection_group": "",
+                        "rule_collection": coll_name,
+                        "action": coll_action,
+                        "rule_name": rule.get("name", ""),
+                        "rule_type": "NetworkRule" if coll_type == "networkRuleCollections" else "ApplicationRule",
+                        "source_addresses": rule.get("sourceAddresses") or [],
+                        "destination_addresses": rule.get("destinationAddresses") or rule.get("targetFqdns") or [],
+                        "destination_ports": rule.get("destinationPorts") or [],
+                        "protocols": rule.get("protocols") or [],
+                        "source": "classic",
+                    })
+
+    # ── Messaging (Service Bus, Event Hub, Redis) ──
+    for row in raw.get("service_bus_eventhub_redis", []):
+        sub_id = row.get("subscriptionId", "")
+        if sub_id not in subscriptions:
+            continue
+        subscriptions[sub_id]["messaging"].append({
+            "name": row.get("name", ""),
+            "resource_group": row.get("resourceGroup", ""),
+            "type": row.get("type", ""),
+            "location": row.get("location", ""),
+            "sku": row.get("sku") or "",
+            "public_network_access": row.get("publicNetworkAccess") or "Enabled",
+            "min_tls_version": row.get("minimumTlsVersion") or "",
+            "pe_count": row.get("peCount") or 0,
+            "default_action": row.get("defaultAction") or "Allow",
+        })
+
     # ── NSG Analysis ──
     _build_nsg_analysis(subscriptions, nsg_map)
 
@@ -1146,6 +1650,11 @@ def enrich_with_rest(client, subscriptions):
                 continue
             tasks.append(("storage", sub_id, i, sa["resource_group"], sa["name"]))
 
+    # Collect SQL server auditing enrichment tasks
+    for sub_id, sub_data in subscriptions.items():
+        for i, sql in enumerate(sub_data["sql_servers"]):
+            tasks.append(("sql_audit", sub_id, i, sql["resource_group"], sql["name"]))
+
     if not tasks:
         _compute_all_verdicts(subscriptions)
         return
@@ -1156,6 +1665,8 @@ def enrich_with_rest(client, subscriptions):
         kind, sub_id, idx, rg, name = task
         if kind == "app":
             return _enrich_app(client, sub_id, rg, name)
+        elif kind == "sql_audit":
+            return _enrich_sql_audit(client, sub_id, rg, name)
         else:
             return _enrich_storage(client, sub_id, rg, name)
 
@@ -1180,6 +1691,9 @@ def enrich_with_rest(client, subscriptions):
             app["ip_restrictions_count"] = result.get("ip_restrictions_count", 0)
             app["has_ip_restrictions"] = result.get("has_ip_restrictions", False)
             app["min_tls_version"] = result.get("min_tls_version", "1.0")
+        elif kind == "sql_audit":
+            sql = subscriptions[sub_id]["sql_servers"][idx]
+            sql["auditing_enabled"] = result.get("auditing_enabled", False)
         else:
             sa = subscriptions[sub_id]["storage_accounts"][idx]
             sa["public_containers"] = result.get("public_containers", 0)
@@ -1212,6 +1726,18 @@ def _enrich_app(client, sub_id, rg, name):
         "has_ip_restrictions": len(real_rules) > 0,
         "min_tls_version": tls_ver,
     }
+
+
+def _enrich_sql_audit(client, sub_id, rg, name):
+    """Fetch SQL Server auditing status."""
+    url = (
+        f"{ARM_BASE}/subscriptions/{sub_id}/resourceGroups/{rg}"
+        f"/providers/Microsoft.Sql/servers/{name}"
+        f"/auditingSettings/default"
+    )
+    data = client.arm_get(url, api_version="2021-11-01")
+    state = data.get("properties", {}).get("state", "")
+    return {"auditing_enabled": state == "Enabled"}
 
 
 def _enrich_storage(client, sub_id, rg, name):
@@ -1322,6 +1848,9 @@ def run_validation(snapshot_subs):
             sub_id, sub_data["name"], sub_data["vnets"], all_firewall_maps,
         )
         sub_data["gaps"].extend(peering_gaps)
+
+    # Resource-level gaps (v3.0: SQL, Cosmos, Key Vault, AKS, Firewall, Messaging)
+    _analyze_resource_gaps(snapshot_subs)
 
     # Flow log gaps
     for sub_id, sub_data in snapshot_subs.items():
@@ -1624,6 +2153,380 @@ def _analyze_peering_gaps(sub_id, sub_name, vnets, all_firewall_maps):
     return gaps
 
 
+def _analyze_resource_gaps(snapshot_subs):
+    """Analyze resource-level security gaps for v3.0 resource types."""
+    for sub_id, sub_data in snapshot_subs.items():
+        # ── SQL Server gaps ──
+        for sql in sub_data.get("sql_servers", []):
+            server_name = sql["name"]
+            pe_count = sql.get("pe_count", 0)
+
+            # CRITICAL: SQL-ALLOW-ALL-AZURE
+            has_allow_all_azure = any(
+                fw.get("start_ip") == "0.0.0.0" and fw.get("end_ip") == "0.0.0.0"
+                for fw in sql.get("firewall_rules", [])
+            )
+            if has_allow_all_azure and pe_count == 0:
+                sub_data["gaps"].append({
+                    "type": "SQL-ALLOW-ALL-AZURE", "severity": "CRITICAL",
+                    "vnet": "", "subnet": "", "subnet_prefix": "",
+                    "has_nsg": False, "has_route_table": False,
+                    "has_firewall_route": False, "internet_access": "",
+                    "detail": f"{server_name} has 'Allow Azure services' enabled with no private endpoints — any Azure tenant can connect",
+                })
+
+            # HIGH: SQL-PUBLIC-EXPOSED
+            pub_access = sql.get("public_network_access", "Enabled")
+            if pub_access != "Disabled" and pe_count == 0:
+                sub_data["gaps"].append({
+                    "type": "SQL-PUBLIC-EXPOSED", "severity": "HIGH",
+                    "vnet": "", "subnet": "", "subnet_prefix": "",
+                    "has_nsg": False, "has_route_table": False,
+                    "has_firewall_route": False, "internet_access": "",
+                    "detail": f"SQL server '{server_name}' has public network access enabled with no private endpoints",
+                })
+
+            # HIGH: SQL-WIDE-FIREWALL
+            for fw in sql.get("firewall_rules", []):
+                try:
+                    start = int(ipaddress.IPv4Address(fw.get("start_ip", "0.0.0.0")))
+                    end = int(ipaddress.IPv4Address(fw.get("end_ip", "0.0.0.0")))
+                    span = end - start
+                    if span > 256:
+                        sub_data["gaps"].append({
+                            "type": "SQL-WIDE-FIREWALL", "severity": "HIGH",
+                            "vnet": "", "subnet": "", "subnet_prefix": "",
+                            "has_nsg": False, "has_route_table": False,
+                            "has_firewall_route": False, "internet_access": "",
+                            "detail": f"SQL server '{server_name}' firewall rule '{fw['name']}' spans {span:,} IPs ({fw['start_ip']} → {fw['end_ip']})",
+                        })
+                except (ValueError, TypeError):
+                    pass
+
+            # MEDIUM: SQL-WEAK-TLS
+            tls = sql.get("min_tls_version", "")
+            if tls and tls < "1.2":
+                sub_data["gaps"].append({
+                    "type": "SQL-WEAK-TLS", "severity": "MEDIUM",
+                    "vnet": "", "subnet": "", "subnet_prefix": "",
+                    "has_nsg": False, "has_route_table": False,
+                    "has_firewall_route": False, "internet_access": "",
+                    "detail": f"SQL server '{server_name}' allows TLS {tls} (minimum 1.2 recommended)",
+                })
+
+            # MEDIUM: SQL-NO-AUDITING
+            if sql.get("auditing_enabled") is False:
+                sub_data["gaps"].append({
+                    "type": "SQL-NO-AUDITING", "severity": "MEDIUM",
+                    "vnet": "", "subnet": "", "subnet_prefix": "",
+                    "has_nsg": False, "has_route_table": False,
+                    "has_firewall_route": False, "internet_access": "",
+                    "detail": f"SQL server '{server_name}' does not have auditing enabled",
+                })
+
+        # ── Cosmos DB gaps ──
+        for cosmos in sub_data.get("cosmos_db", []):
+            cosmos_name = cosmos["name"]
+            pub = cosmos.get("public_network_access", "Enabled")
+
+            # HIGH: COSMOS-PUBLIC-NO-FILTER
+            if (pub != "Disabled"
+                    and cosmos.get("ip_rules_count", 0) == 0
+                    and not cosmos.get("vnet_filter")
+                    and cosmos.get("pe_count", 0) == 0):
+                sub_data["gaps"].append({
+                    "type": "COSMOS-PUBLIC-NO-FILTER", "severity": "HIGH",
+                    "vnet": "", "subnet": "", "subnet_prefix": "",
+                    "has_nsg": False, "has_route_table": False,
+                    "has_firewall_route": False, "internet_access": "",
+                    "detail": f"Cosmos DB '{cosmos_name}' is publicly accessible with no IP rules, VNet filter, or private endpoints",
+                })
+
+            # MEDIUM: COSMOS-LOCAL-AUTH
+            if not cosmos.get("disable_local_auth") and pub != "Disabled":
+                sub_data["gaps"].append({
+                    "type": "COSMOS-LOCAL-AUTH", "severity": "MEDIUM",
+                    "vnet": "", "subnet": "", "subnet_prefix": "",
+                    "has_nsg": False, "has_route_table": False,
+                    "has_firewall_route": False, "internet_access": "",
+                    "detail": f"Cosmos DB '{cosmos_name}' has local authentication enabled with public access — key-based auth is weaker than Entra ID",
+                })
+
+        # ── Key Vault gaps ──
+        for kv in sub_data.get("key_vaults", []):
+            kv_name = kv["name"]
+
+            # HIGH: KEYVAULT-NETWORK-OPEN
+            if (kv.get("network_default_action") == "Allow"
+                    and kv.get("public_network_access") != "Disabled"):
+                sub_data["gaps"].append({
+                    "type": "KEYVAULT-NETWORK-OPEN", "severity": "HIGH",
+                    "vnet": "", "subnet": "", "subnet_prefix": "",
+                    "has_nsg": False, "has_route_table": False,
+                    "has_firewall_route": False, "internet_access": "",
+                    "detail": f"Key Vault '{kv_name}' has default network action Allow — accessible from any network",
+                })
+
+            # MEDIUM: KEYVAULT-NO-PRIVATE-ENDPOINT
+            if kv.get("pe_count", 0) == 0:
+                sub_data["gaps"].append({
+                    "type": "KEYVAULT-NO-PRIVATE-ENDPOINT", "severity": "MEDIUM",
+                    "vnet": "", "subnet": "", "subnet_prefix": "",
+                    "has_nsg": False, "has_route_table": False,
+                    "has_firewall_route": False, "internet_access": "",
+                    "detail": f"Key Vault '{kv_name}' has no private endpoints — IP-based restrictions alone are weaker",
+                })
+
+        # ── MySQL / PostgreSQL gaps ──
+        for db in sub_data.get("mysql_postgresql", []):
+            db_name = db["name"]
+            db_type = db.get("type", "").split("/")[-1]
+
+            # HIGH: DB-PUBLIC-EXPOSED
+            if (db.get("public_network_access") != "Disabled"
+                    and db.get("pe_count", 0) == 0):
+                sub_data["gaps"].append({
+                    "type": "DB-PUBLIC-EXPOSED", "severity": "HIGH",
+                    "vnet": "", "subnet": "", "subnet_prefix": "",
+                    "has_nsg": False, "has_route_table": False,
+                    "has_firewall_route": False, "internet_access": "",
+                    "detail": f"{db_type} server '{db_name}' has public network access enabled with no private endpoints",
+                })
+
+            # MEDIUM: DB-NO-SSL
+            ssl = db.get("ssl_enforcement", "")
+            if ssl and ssl != "Enabled":
+                sub_data["gaps"].append({
+                    "type": "DB-NO-SSL", "severity": "MEDIUM",
+                    "vnet": "", "subnet": "", "subnet_prefix": "",
+                    "has_nsg": False, "has_route_table": False,
+                    "has_firewall_route": False, "internet_access": "",
+                    "detail": f"{db_type} server '{db_name}' does not enforce SSL connections",
+                })
+
+        # ── AKS gaps ──
+        for aks in sub_data.get("aks_clusters", []):
+            aks_name = aks["name"]
+
+            # CRITICAL: AKS-PUBLIC-API-NO-RESTRICTIONS
+            ip_ranges = aks.get("authorized_ip_ranges") or []
+            if not aks.get("private_cluster") and not ip_ranges:
+                sub_data["gaps"].append({
+                    "type": "AKS-PUBLIC-API-NO-RESTRICTIONS", "severity": "CRITICAL",
+                    "vnet": "", "subnet": "", "subnet_prefix": "",
+                    "has_nsg": False, "has_route_table": False,
+                    "has_firewall_route": False, "internet_access": "",
+                    "detail": f"AKS cluster '{aks_name}' API server is public with no IP restrictions — anyone can attempt authentication",
+                })
+
+            # MEDIUM: AKS-NO-NETWORK-POLICY
+            if not aks.get("network_policy"):
+                sub_data["gaps"].append({
+                    "type": "AKS-NO-NETWORK-POLICY", "severity": "MEDIUM",
+                    "vnet": "", "subnet": "", "subnet_prefix": "",
+                    "has_nsg": False, "has_route_table": False,
+                    "has_firewall_route": False, "internet_access": "",
+                    "detail": f"AKS cluster '{aks_name}' has no network policy — pods can communicate without restrictions",
+                })
+
+        # ── Firewall gaps ──
+        for fw in sub_data.get("firewalls", []):
+            fw_name = fw["name"]
+
+            # HIGH: FIREWALL-THREAT-INTEL-OFF
+            mode = fw.get("threat_intel_mode", "")
+            if mode in ("Off", "Alert", ""):
+                sub_data["gaps"].append({
+                    "type": "FIREWALL-THREAT-INTEL-OFF", "severity": "HIGH",
+                    "vnet": "", "subnet": "", "subnet_prefix": "",
+                    "has_nsg": False, "has_route_table": False,
+                    "has_firewall_route": False, "internet_access": "",
+                    "detail": f"Azure Firewall '{fw_name}' threat intelligence mode is '{mode or 'not set'}' — should be 'Deny' to block known malicious IPs",
+                })
+
+        # HIGH: FIREWALL-PERMISSIVE-RULE
+        for rule in sub_data.get("firewall_rules", []):
+            sources = rule.get("source_addresses") or []
+            dests = rule.get("destination_addresses") or []
+            ports = rule.get("destination_ports") or []
+            if ("*" in sources or "*" in dests) and "*" in ports:
+                sub_data["gaps"].append({
+                    "type": "FIREWALL-PERMISSIVE-RULE", "severity": "HIGH",
+                    "vnet": "", "subnet": "", "subnet_prefix": "",
+                    "has_nsg": False, "has_route_table": False,
+                    "has_firewall_route": False, "internet_access": "",
+                    "detail": (
+                        f"Firewall rule '{rule.get('rule_name', '')}' in "
+                        f"collection '{rule.get('rule_collection', '')}' "
+                        f"(policy: {rule.get('firewall_policy', '')}) "
+                        f"has wildcard source/dest with all ports"
+                    ),
+                })
+
+        # ── Messaging gaps ──
+        for msg in sub_data.get("messaging", []):
+            msg_name = msg["name"]
+            msg_type = msg.get("type", "").split("/")[-1]
+
+            # MEDIUM: MESSAGING-PUBLIC-EXPOSED
+            if (msg.get("public_network_access") != "Disabled"
+                    and msg.get("pe_count", 0) == 0
+                    and msg.get("default_action") == "Allow"):
+                sub_data["gaps"].append({
+                    "type": "MESSAGING-PUBLIC-EXPOSED", "severity": "MEDIUM",
+                    "vnet": "", "subnet": "", "subnet_prefix": "",
+                    "has_nsg": False, "has_route_table": False,
+                    "has_firewall_route": False, "internet_access": "",
+                    "detail": f"{msg_type} '{msg_name}' is publicly accessible with no private endpoints and default action Allow",
+                })
+
+
+# ─── Phase 5: Advisory Report ────────────────────────────────────────────────
+
+
+def generate_advisory(subscriptions, metadata):
+    """Generate a themed Markdown security advisory from validated snapshot."""
+    # Collect all gaps tagged with subscription info
+    all_findings = []
+    for sub_id, sub_data in subscriptions.items():
+        sub_name = sub_data["name"]
+        for gap in sub_data.get("gaps", []):
+            all_findings.append({
+                "sub_id": sub_id,
+                "sub_name": sub_name,
+                "type": gap["type"],
+                "severity": gap["severity"],
+                "detail": gap.get("detail", ""),
+            })
+
+    timestamp_str = metadata.get("timestamp", datetime.now(timezone.utc).isoformat())
+    try:
+        dt = datetime.fromisoformat(timestamp_str.replace("Z", "+00:00"))
+        date_str = dt.strftime("%Y-%m-%d %H:%M") + " UTC"
+    except (ValueError, AttributeError):
+        date_str = timestamp_str
+
+    sub_count = metadata.get("subscriptions_scanned", len(subscriptions))
+
+    if not all_findings:
+        lines = [
+            f"# Azure Network Security Advisory\n",
+            f"**Tenant Audit** — {date_str}\n\n",
+            f"{sub_count} subscriptions scanned | No findings\n\n",
+            "No security findings were identified in this audit.\n",
+        ]
+        ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+        filename = f"advisory-{ts}.md"
+        with open(filename, "w") as f:
+            f.writelines(lines)
+        return filename
+
+    # Consolidate by (sub_id, gap_type) — merge details into bulleted list
+    consolidated = {}  # (sub_id, gap_type) → {sub_name, severity, details: [str]}
+    for finding in all_findings:
+        key = (finding["sub_id"], finding["type"])
+        if key not in consolidated:
+            consolidated[key] = {
+                "sub_name": finding["sub_name"],
+                "type": finding["type"],
+                "severity": finding["severity"],
+                "details": [],
+            }
+        consolidated[key]["details"].append(finding["detail"])
+
+    # Organize by theme
+    themed_sections = []
+    themes_with_findings = 0
+    severity_counts = {"CRITICAL": 0, "HIGH": 0, "MEDIUM": 0}
+    total_findings = 0
+
+    for theme_name, gap_types in ADVISORY_THEMES:
+        theme_entries = []
+        for key, entry in consolidated.items():
+            if entry["type"] in gap_types:
+                theme_entries.append(entry)
+                severity_counts[entry["severity"]] = severity_counts.get(entry["severity"], 0) + 1
+                total_findings += 1
+        if theme_entries:
+            themes_with_findings += 1
+            # Sort within theme: CRITICAL first, then HIGH, then MEDIUM
+            sev_order = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2}
+            theme_entries.sort(key=lambda e: (sev_order.get(e["severity"], 9), e["sub_name"]))
+            themed_sections.append((theme_name, theme_entries))
+
+    # Generate Markdown
+    lines = []
+
+    # Header
+    lines.append(f"# Azure Network Security Advisory\n")
+    lines.append(f"**Tenant Audit** — {date_str}\n\n")
+    lines.append(
+        f"{sub_count} subscriptions scanned | "
+        f"{total_findings} findings across {themes_with_findings} categories\n\n"
+    )
+
+    # Severity summary
+    lines.append("**Severity breakdown:** ")
+    parts = []
+    if severity_counts.get("CRITICAL", 0):
+        parts.append(f"{severity_counts['CRITICAL']} CRITICAL")
+    if severity_counts.get("HIGH", 0):
+        parts.append(f"{severity_counts['HIGH']} HIGH")
+    if severity_counts.get("MEDIUM", 0):
+        parts.append(f"{severity_counts['MEDIUM']} MEDIUM")
+    lines.append(" | ".join(parts) + "\n\n")
+
+    # Table of contents
+    lines.append("---\n\n")
+    lines.append("## Contents\n\n")
+    for i, (theme_name, _) in enumerate(themed_sections, 1):
+        anchor = theme_name.lower().replace(" ", "-").replace("/", "")
+        lines.append(f"{i}. [{theme_name}](#{anchor})\n")
+    lines.append("\n---\n\n")
+
+    # Themed sections
+    for theme_name, entries in themed_sections:
+        lines.append(f"## {theme_name}\n\n")
+
+        for entry in entries:
+            gap_type = entry["type"]
+            details = entry["details"]
+            count = len(details)
+
+            # Title: gap type with count if consolidated
+            if count > 1:
+                title = f"{gap_type} ({count} instances)"
+            else:
+                title = gap_type
+
+            lines.append(f"### {title}\n")
+            lines.append(f"**Subscription:** {entry['sub_name']}\n")
+            lines.append(f"**Severity:** {entry['severity']}\n\n")
+
+            # Resource details
+            if count == 1:
+                lines.append(f"{details[0]}\n\n")
+            else:
+                for d in details:
+                    lines.append(f"- {d}\n")
+                lines.append("\n")
+
+            # Impact narrative
+            narrative = IMPACT_NARRATIVES.get(gap_type, "")
+            if narrative:
+                lines.append(f"{narrative}\n\n")
+
+        lines.append("---\n\n")
+
+    # Write advisory file
+    ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+    filename = f"advisory-{ts}.md"
+    with open(filename, "w") as f:
+        f.writelines(lines)
+
+    return filename
+
+
 # ─── Snapshot Orchestrator ────────────────────────────────────────────────────
 
 
@@ -1631,7 +2534,7 @@ def take_snapshot():
     """Orchestrate all phases and write snapshot JSON."""
     start_time = time.time()
 
-    printerr(f"\n{BOLD}Azure Network Auditor v{VERSION} — Resource Graph Edition{NC}")
+    printerr(f"\n{BOLD}Azure Cloud Auditor v{VERSION} — Resource Graph Edition{NC}")
     printerr(f"{BOLD}{'=' * 52}{NC}\n")
 
     # Init client
@@ -1649,11 +2552,11 @@ def take_snapshot():
     printerr(f"Found {GREEN}{len(subs)}{NC} enabled subscription(s)\n")
 
     # Phase 1: Discovery (Resource Graph)
-    printerr(f"{BOLD}[Phase 1/4] Discovering resources via Resource Graph...{NC}\n")
+    printerr(f"{BOLD}[Phase 1/5] Discovering resources via Resource Graph...{NC}\n")
     raw = run_discovery(client, sub_ids)
 
     # Phase 2: Assembly
-    printerr(f"\n{BOLD}[Phase 2/4] Assembling snapshot data...{NC}")
+    printerr(f"\n{BOLD}[Phase 2/5] Assembling snapshot data...{NC}")
     subscriptions = assemble_snapshot(subs, raw)
 
     # Count what we got
@@ -1667,11 +2570,11 @@ def take_snapshot():
     )
 
     # Phase 3: REST Enrichment
-    printerr(f"\n{BOLD}[Phase 3/4] Enriching with REST API calls...{NC}")
+    printerr(f"\n{BOLD}[Phase 3/5] Enriching with REST API calls...{NC}")
     enrich_with_rest(client, subscriptions)
 
     # Phase 4: Validation
-    printerr(f"\n{BOLD}[Phase 4/4] Running validation and gap analysis...{NC}")
+    printerr(f"\n{BOLD}[Phase 4/5] Running validation and gap analysis...{NC}")
     run_validation(subscriptions)
 
     # Gap summary
@@ -1749,6 +2652,21 @@ def take_snapshot():
 
     printerr(f"  → {BOLD}{filename}{NC} ({size_str})")
 
+    # Phase 5: Advisory Report
+    printerr(f"\n{BOLD}[Phase 5/5] Generating security advisory...{NC}")
+    advisory_file = generate_advisory(subscriptions, snapshot["metadata"])
+    advisory_size = os.path.getsize(advisory_file)
+    adv_size_str = f"{advisory_size / 1024:.0f} KB" if advisory_size < 1024 * 1024 else f"{advisory_size / 1024 / 1024:.1f} MB"
+    printerr(f"  → {BOLD}{advisory_file}{NC} ({adv_size_str})")
+
+    total_findings = sum(len(s["gaps"]) for s in subscriptions.values())
+    printerr(
+        f"  {total_findings} finding(s): "
+        f"{RED}{gap_counts.get('CRITICAL', 0)} critical{NC}, "
+        f"{RED}{gap_counts.get('HIGH', 0)} high{NC}, "
+        f"{YELLOW}{gap_counts.get('MEDIUM', 0)} medium{NC}"
+    )
+
     mins, secs = divmod(duration, 60)
     printerr(
         f"\n{GREEN}Done{NC} in {mins}m {secs}s. "
@@ -1759,7 +2677,7 @@ def take_snapshot():
     return filename
 
 
-# ─── Diff Engine (identical to v1.2) ─────────────────────────────────────────
+# ─── Diff Engine ─────────────────────────────────────────────────────────────
 
 
 def find_snapshots():
@@ -1784,6 +2702,9 @@ def _count_items(snapshot):
         "peerings": 0, "gateways": 0, "public_ips": 0, "policies": 0,
         "gaps": 0, "resources": 0, "nsg_analysis": 0, "storage": 0,
         "flow_logs": 0, "private_dns": 0, "app_services": 0,
+        "sql_servers": 0, "cosmos_db": 0, "mysql_postgresql": 0,
+        "key_vaults": 0, "aks_clusters": 0, "firewalls": 0,
+        "firewall_rules": 0, "messaging": 0,
     }
     nsg_set = set()
     rt_set = set()
@@ -1796,6 +2717,14 @@ def _count_items(snapshot):
         counts["flow_logs"] += len(sub.get("flow_logs", []))
         counts["private_dns"] += len(sub.get("private_dns_zones", []))
         counts["app_services"] += len(sub.get("app_services", []))
+        counts["sql_servers"] += len(sub.get("sql_servers", []))
+        counts["cosmos_db"] += len(sub.get("cosmos_db", []))
+        counts["mysql_postgresql"] += len(sub.get("mysql_postgresql", []))
+        counts["key_vaults"] += len(sub.get("key_vaults", []))
+        counts["aks_clusters"] += len(sub.get("aks_clusters", []))
+        counts["firewalls"] += len(sub.get("firewalls", []))
+        counts["firewall_rules"] += len(sub.get("firewall_rules", []))
+        counts["messaging"] += len(sub.get("messaging", []))
         for vnet_id, vnet in sub.get("vnets", {}).items():
             counts["vnets"] += 1
             counts["peerings"] += len(vnet.get("peerings", []))
@@ -1983,6 +2912,110 @@ def diff_snapshots(old, new):
         ["verdict", "https_only", "min_tls_version", "public_network_access"]
     )
 
+    # SQL Servers
+    old_sql, new_sql = {}, {}
+    for sub_id, sub in old.get("subscriptions", {}).items():
+        for s in sub.get("sql_servers", []):
+            old_sql[f"{sub.get('name', sub_id)} / {s['name']}"] = s
+    for sub_id, sub in new.get("subscriptions", {}).items():
+        for s in sub.get("sql_servers", []):
+            new_sql[f"{sub.get('name', sub_id)} / {s['name']}"] = s
+    diff["categories"]["sql_servers"] = _diff_dicts(
+        old_sql, new_sql, _sql_server_summary,
+        ["public_network_access", "min_tls_version", "pe_count", "auditing_enabled"]
+    )
+
+    # Cosmos DB
+    old_cosmos, new_cosmos = {}, {}
+    for sub_id, sub in old.get("subscriptions", {}).items():
+        for c in sub.get("cosmos_db", []):
+            old_cosmos[f"{sub.get('name', sub_id)} / {c['name']}"] = c
+    for sub_id, sub in new.get("subscriptions", {}).items():
+        for c in sub.get("cosmos_db", []):
+            new_cosmos[f"{sub.get('name', sub_id)} / {c['name']}"] = c
+    diff["categories"]["cosmos_db"] = _diff_dicts(
+        old_cosmos, new_cosmos, _cosmos_summary,
+        ["public_network_access", "ip_rules_count", "vnet_filter", "pe_count"]
+    )
+
+    # MySQL/PostgreSQL
+    old_db, new_db = {}, {}
+    for sub_id, sub in old.get("subscriptions", {}).items():
+        for d in sub.get("mysql_postgresql", []):
+            old_db[f"{sub.get('name', sub_id)} / {d['name']}"] = d
+    for sub_id, sub in new.get("subscriptions", {}).items():
+        for d in sub.get("mysql_postgresql", []):
+            new_db[f"{sub.get('name', sub_id)} / {d['name']}"] = d
+    diff["categories"]["mysql_postgresql"] = _diff_dicts(
+        old_db, new_db, _db_summary,
+        ["public_network_access", "ssl_enforcement", "pe_count"]
+    )
+
+    # Key Vaults
+    old_kv, new_kv = {}, {}
+    for sub_id, sub in old.get("subscriptions", {}).items():
+        for k in sub.get("key_vaults", []):
+            old_kv[f"{sub.get('name', sub_id)} / {k['name']}"] = k
+    for sub_id, sub in new.get("subscriptions", {}).items():
+        for k in sub.get("key_vaults", []):
+            new_kv[f"{sub.get('name', sub_id)} / {k['name']}"] = k
+    diff["categories"]["key_vaults"] = _diff_dicts(
+        old_kv, new_kv, _kv_summary,
+        ["network_default_action", "pe_count", "public_network_access"]
+    )
+
+    # AKS Clusters
+    old_aks, new_aks = {}, {}
+    for sub_id, sub in old.get("subscriptions", {}).items():
+        for a in sub.get("aks_clusters", []):
+            old_aks[f"{sub.get('name', sub_id)} / {a['name']}"] = a
+    for sub_id, sub in new.get("subscriptions", {}).items():
+        for a in sub.get("aks_clusters", []):
+            new_aks[f"{sub.get('name', sub_id)} / {a['name']}"] = a
+    diff["categories"]["aks_clusters"] = _diff_dicts(
+        old_aks, new_aks, _aks_summary,
+        ["private_cluster", "authorized_ip_ranges", "network_policy"]
+    )
+
+    # Firewalls
+    old_fw, new_fw = {}, {}
+    for sub_id, sub in old.get("subscriptions", {}).items():
+        for f in sub.get("firewalls", []):
+            old_fw[f"{sub.get('name', sub_id)} / {f['name']}"] = f
+    for sub_id, sub in new.get("subscriptions", {}).items():
+        for f in sub.get("firewalls", []):
+            new_fw[f"{sub.get('name', sub_id)} / {f['name']}"] = f
+    diff["categories"]["firewalls"] = _diff_dicts(
+        old_fw, new_fw, _firewall_summary,
+        ["sku_tier", "threat_intel_mode"]
+    )
+
+    # Firewall Rules
+    old_fr, new_fr = {}, {}
+    for sub_id, sub in old.get("subscriptions", {}).items():
+        for r in sub.get("firewall_rules", []):
+            old_fr[f"{sub.get('name', sub_id)} / {r.get('firewall_policy', '')} / {r.get('rule_name', '')}"] = r
+    for sub_id, sub in new.get("subscriptions", {}).items():
+        for r in sub.get("firewall_rules", []):
+            new_fr[f"{sub.get('name', sub_id)} / {r.get('firewall_policy', '')} / {r.get('rule_name', '')}"] = r
+    diff["categories"]["firewall_rules"] = _diff_dicts(
+        old_fr, new_fr, _firewall_rule_summary,
+        ["source_addresses", "destination_addresses", "destination_ports", "action"]
+    )
+
+    # Messaging
+    old_msg, new_msg = {}, {}
+    for sub_id, sub in old.get("subscriptions", {}).items():
+        for m in sub.get("messaging", []):
+            old_msg[f"{sub.get('name', sub_id)} / {m['name']}"] = m
+    for sub_id, sub in new.get("subscriptions", {}).items():
+        for m in sub.get("messaging", []):
+            new_msg[f"{sub.get('name', sub_id)} / {m['name']}"] = m
+    diff["categories"]["messaging"] = _diff_dicts(
+        old_msg, new_msg, _messaging_summary,
+        ["public_network_access", "pe_count", "default_action"]
+    )
+
     return diff
 
 
@@ -2055,6 +3088,30 @@ def _dns_zone_summary(z):
 def _app_service_summary(a):
     return f"{a.get('kind', 'app')} — {a.get('verdict', '')}"
 
+def _sql_server_summary(s):
+    return f"{s.get('name', '')} — public: {s.get('public_network_access', '')}"
+
+def _cosmos_summary(c):
+    return f"{c.get('name', '')} — PE: {c.get('pe_count', 0)}"
+
+def _db_summary(d):
+    return f"{d.get('name', '')} ({d.get('type', '').split('/')[-1]})"
+
+def _kv_summary(k):
+    return f"{k.get('name', '')} — default: {k.get('network_default_action', '')}"
+
+def _aks_summary(a):
+    return f"{a.get('name', '')} — private: {a.get('private_cluster', False)}"
+
+def _firewall_summary(fw):
+    return f"{fw.get('name', '')} — {fw.get('sku_tier', '')}"
+
+def _firewall_rule_summary(fr):
+    return f"{fr.get('rule_name', '')} ({fr.get('action', '')})"
+
+def _messaging_summary(m):
+    return f"{m.get('name', '')} ({m.get('type', '').split('/')[-1]})"
+
 
 # ─── Diff Display + Export ────────────────────────────────────────────────────
 
@@ -2070,6 +3127,10 @@ def print_diff_summary(diff):
         ("Gateways", "gateways"), ("Public IPs", "public_ips"),
         ("Policies", "policies"), ("Flow Logs", "flow_logs"),
         ("Private DNS", "private_dns"), ("App Services", "app_services"),
+        ("SQL Servers", "sql_servers"), ("Cosmos DB", "cosmos_db"),
+        ("MySQL/PostgreSQL", "mysql_postgresql"), ("Key Vaults", "key_vaults"),
+        ("AKS Clusters", "aks_clusters"), ("Firewalls", "firewalls"),
+        ("Firewall Rules", "firewall_rules"), ("Messaging", "messaging"),
         ("Gaps", "gaps"), ("Resources", "resources"),
     ]
     for label, key in items:
@@ -2216,7 +3277,12 @@ def _export_diff(diff, cats_with_changes):
         ("Subnets", "subnets"), ("NSGs", "nsgs"),
         ("Route Tables", "route_tables"), ("Peerings", "peerings"),
         ("Gateways", "gateways"), ("Public IPs", "public_ips"),
-        ("Policies", "policies"), ("Gaps", "gaps"), ("Resources", "resources"),
+        ("Policies", "policies"),
+        ("SQL Servers", "sql_servers"), ("Cosmos DB", "cosmos_db"),
+        ("MySQL/PostgreSQL", "mysql_postgresql"), ("Key Vaults", "key_vaults"),
+        ("AKS Clusters", "aks_clusters"), ("Firewalls", "firewalls"),
+        ("Firewall Rules", "firewall_rules"), ("Messaging", "messaging"),
+        ("Gaps", "gaps"), ("Resources", "resources"),
     ]:
         ov, nv = old_c.get(key, 0), new_c.get(key, 0)
         delta = nv - ov
@@ -2243,7 +3309,7 @@ def _export_diff(diff, cats_with_changes):
     print(f"\nDiff exported to: {BOLD}{filename}{NC}")
 
 
-# ─── CSV Export (identical to v1.2) ──────────────────────────────────────────
+# ─── CSV Export ──────────────────────────────────────────────────────────────
 
 
 def export_csv(snapshot_path):
@@ -2476,7 +3542,104 @@ def export_csv(snapshot_path):
                             "Yes" if app.get("has_ip_restrictions") else "No",
                             app.get("verdict", ""), app.get("details", "")])
 
-    print(f"\n{GREEN}Exported 12 CSV files to: {BOLD}{outdir}/{NC}")
+    # 13. sql-servers.csv
+    with open(os.path.join(outdir, "sql-servers.csv"), "w", newline="") as f:
+        w = csv.writer(f, quoting=csv.QUOTE_ALL)
+        w.writerow(["Subscription", "SubscriptionId", "ServerName", "ResourceGroup",
+                     "Location", "PublicNetworkAccess", "MinTLSVersion",
+                     "PrivateEndpoints", "AuditingEnabled", "FirewallRulesCount", "State"])
+        for sub_id, sub in snapshot.get("subscriptions", {}).items():
+            for sql in sub.get("sql_servers", []):
+                w.writerow([sub["name"], sub_id, sql["name"], sql.get("resource_group", ""),
+                            sql.get("location", ""), sql.get("public_network_access", ""),
+                            sql.get("min_tls_version", ""), sql.get("pe_count", 0),
+                            "Yes" if sql.get("auditing_enabled") else "No",
+                            len(sql.get("firewall_rules", [])), sql.get("state", "")])
+
+    # 14. cosmos-db.csv
+    with open(os.path.join(outdir, "cosmos-db.csv"), "w", newline="") as f:
+        w = csv.writer(f, quoting=csv.QUOTE_ALL)
+        w.writerow(["Subscription", "SubscriptionId", "AccountName", "ResourceGroup",
+                     "Location", "PublicNetworkAccess", "IPRulesCount",
+                     "VNetFilter", "DisableLocalAuth", "PrivateEndpoints"])
+        for sub_id, sub in snapshot.get("subscriptions", {}).items():
+            for c in sub.get("cosmos_db", []):
+                w.writerow([sub["name"], sub_id, c["name"], c.get("resource_group", ""),
+                            c.get("location", ""), c.get("public_network_access", ""),
+                            c.get("ip_rules_count", 0),
+                            "Yes" if c.get("vnet_filter") else "No",
+                            "Yes" if c.get("disable_local_auth") else "No",
+                            c.get("pe_count", 0)])
+
+    # 15. mysql-postgresql.csv
+    with open(os.path.join(outdir, "mysql-postgresql.csv"), "w", newline="") as f:
+        w = csv.writer(f, quoting=csv.QUOTE_ALL)
+        w.writerow(["Subscription", "SubscriptionId", "ServerName", "ResourceGroup",
+                     "Type", "Location", "PublicNetworkAccess", "SSLEnforcement",
+                     "PrivateEndpoints"])
+        for sub_id, sub in snapshot.get("subscriptions", {}).items():
+            for d in sub.get("mysql_postgresql", []):
+                w.writerow([sub["name"], sub_id, d["name"], d.get("resource_group", ""),
+                            d.get("type", ""), d.get("location", ""),
+                            d.get("public_network_access", ""),
+                            d.get("ssl_enforcement", ""), d.get("pe_count", 0)])
+
+    # 16. key-vaults.csv
+    with open(os.path.join(outdir, "key-vaults.csv"), "w", newline="") as f:
+        w = csv.writer(f, quoting=csv.QUOTE_ALL)
+        w.writerow(["Subscription", "SubscriptionId", "VaultName", "ResourceGroup",
+                     "Location", "NetworkDefaultAction", "IPRules", "VNetRules",
+                     "PrivateEndpoints", "PublicNetworkAccess"])
+        for sub_id, sub in snapshot.get("subscriptions", {}).items():
+            for kv in sub.get("key_vaults", []):
+                w.writerow([sub["name"], sub_id, kv["name"], kv.get("resource_group", ""),
+                            kv.get("location", ""), kv.get("network_default_action", ""),
+                            kv.get("ip_rules_count", 0), kv.get("vnet_rules_count", 0),
+                            kv.get("pe_count", 0), kv.get("public_network_access", "")])
+
+    # 17. aks-clusters.csv
+    with open(os.path.join(outdir, "aks-clusters.csv"), "w", newline="") as f:
+        w = csv.writer(f, quoting=csv.QUOTE_ALL)
+        w.writerow(["Subscription", "SubscriptionId", "ClusterName", "ResourceGroup",
+                     "Location", "KubernetesVersion", "PrivateCluster",
+                     "AuthorizedIPRanges", "NetworkPlugin", "NetworkPolicy"])
+        for sub_id, sub in snapshot.get("subscriptions", {}).items():
+            for aks in sub.get("aks_clusters", []):
+                ip_ranges = ";".join(aks.get("authorized_ip_ranges") or [])
+                w.writerow([sub["name"], sub_id, aks["name"], aks.get("resource_group", ""),
+                            aks.get("location", ""), aks.get("kubernetes_version", ""),
+                            "Yes" if aks.get("private_cluster") else "No",
+                            ip_ranges, aks.get("network_plugin", ""),
+                            aks.get("network_policy", "")])
+
+    # 18. firewalls.csv
+    with open(os.path.join(outdir, "firewalls.csv"), "w", newline="") as f:
+        w = csv.writer(f, quoting=csv.QUOTE_ALL)
+        w.writerow(["Subscription", "SubscriptionId", "FirewallName", "ResourceGroup",
+                     "Location", "SkuTier", "ThreatIntelMode", "PolicyId",
+                     "ProvisioningState"])
+        for sub_id, sub in snapshot.get("subscriptions", {}).items():
+            for fw in sub.get("firewalls", []):
+                w.writerow([sub["name"], sub_id, fw["name"], fw.get("resource_group", ""),
+                            fw.get("location", ""), fw.get("sku_tier", ""),
+                            fw.get("threat_intel_mode", ""), fw.get("policy_id", ""),
+                            fw.get("provisioning_state", "")])
+
+    # 19. messaging.csv
+    with open(os.path.join(outdir, "messaging.csv"), "w", newline="") as f:
+        w = csv.writer(f, quoting=csv.QUOTE_ALL)
+        w.writerow(["Subscription", "SubscriptionId", "Name", "ResourceGroup",
+                     "Type", "Location", "Sku", "PublicNetworkAccess",
+                     "MinTLSVersion", "PrivateEndpoints", "DefaultAction"])
+        for sub_id, sub in snapshot.get("subscriptions", {}).items():
+            for msg in sub.get("messaging", []):
+                w.writerow([sub["name"], sub_id, msg["name"], msg.get("resource_group", ""),
+                            msg.get("type", ""), msg.get("location", ""),
+                            msg.get("sku", ""), msg.get("public_network_access", ""),
+                            msg.get("min_tls_version", ""), msg.get("pe_count", 0),
+                            msg.get("default_action", "")])
+
+    print(f"\n{GREEN}Exported 19 CSV files to: {BOLD}{outdir}/{NC}")
 
 
 # ─── List + Menu + CLI ───────────────────────────────────────────────────────
@@ -2499,7 +3662,7 @@ def list_snapshots_cmd():
 
 
 def interactive_menu():
-    print(f"\n{BOLD}Azure Network Auditor v{VERSION} (Resource Graph){NC}")
+    print(f"\n{BOLD}Azure Cloud Auditor v{VERSION} (Resource Graph){NC}")
     print(f"{BOLD}{'=' * 45}{NC}")
 
     while True:
@@ -2548,7 +3711,7 @@ def interactive_menu():
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Azure Network Auditor v2.0 — Resource Graph edition.",
+        description="Azure Cloud Auditor v3.0 — Resource Graph edition.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument("--version", action="version", version=f"aznetaudit_rg {VERSION}")
